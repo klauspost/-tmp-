@@ -4,7 +4,7 @@ GoLab
 22nd October 2019
 
 Klaus Post
-Software Developer, MinIO
+Software Engineer, MinIO
 klauspost@gmail.com
 @sh0dan
 
@@ -15,10 +15,12 @@ Using mutexes in real code and managing the complexity.
 
 This is a "life in the trenches", not a theoretical guide.
 
+.image rwmutex/warzone.jpg 400 _ 
+.caption [[https://flic.kr/p/5AFAr9][Morning Calm...]] (cc) by-nc-nd "000815-A-3403V-102"
 
 * The case
 
-.background ./zstd/bg.png
+.background ./rwmutex/winegopher.png
 
 
 * RankDB
@@ -29,7 +31,12 @@ Replacement for a static system calculated every 24h.
 
 No DB system provided reasonable performance.
 
-Relased as open source on github.com/Vivino/rankdb
+Relased as open source on [[https://github.com/Vivino/rankdb][github.com/Vivino/rankdb]]
+
+.image ./rwmutex/highscore.png
+
+.background ./rwmutex/winegopher.png
+.caption "I rock ASS" by Kevin Simpson (CC-BY-SA)
 
 * Numbers
 
@@ -47,6 +54,8 @@ Ranked globally, by Country, by Regional Wine Style (Tuscan Red).
 
 In total about 750k rank lists. Cheers!
 
+.background ./rwmutex/winegopher.png
+
 
 * Design
 
@@ -60,11 +69,9 @@ Each list is sorted, split into *segments*.
 
 Each segment contains elements in a score range. The segment knows how many elements it contains.
 
-Segments always cover the full potential range.
+Segments always cover the full potential range and are lazily split/joined as they grow/shrink.
 
-Segments are lazily split/joined as they grow/shrink.
-
-.image rwmutex/rankdb.png
+.image rwmutex/split.png
 
 
 * Elements
@@ -75,7 +82,7 @@ Elements for each segment marshalled/stored on disk, etc.
 
 A secondary index provides lookup by element ID. It points to the score segment ID.
 
-Indexes are also split into segments/elements.
+.image rwmutex/index.png
 
 * Get rank of ID
 
@@ -93,11 +100,14 @@ This makes it "free" to get neighbors, etc.
 
 * Locking design
 
-We want locking to be fine grained, meaning we don't lock more than we absolutely need to.
+We want locking to be reasonably fine grained. We shouldn't lock more than we absolutely need to.
 
 We want to have concurrent read access to parts that are unaffected by writes.
 
 What are our options?
+
+.image rwmutex/locks.jpg 300 _ 
+.caption [[https://flic.kr/p/dB1H1Q][Love Padlocks]] (cc) by-nc-nd "Nathan Meijer"
 
 * sync.Mutex
 
@@ -120,6 +130,16 @@ What are our options?
  
 In concept in seems simple. In reality there is complexity.
 
+* myown.SpecializedLock
+
+In rare cases it can be useful to have specialized locks to facilitate timeout/deadlines or whatever you require.
+
+However, whenever you diverge from the stdlib your code gets harder to read.
+
+.image rwmutex/toylock.jpg 300 _ 
+.caption [[https://flic.kr/p/9d6w8B][Toy Padlock]] (cc) by "Steve Johnson"
+
+
 * Typical Design
 
 One lock to protect everything:
@@ -131,9 +151,10 @@ One lock to protect everything:
 		index        *Segments
 	}
 
-Pretty easy to maintain.
+Pretty easy to maintain. Only problem is that it will lock information about the list.
 
-Only problem is that it will lock information about the list.
+.image rwmutex/onering.jpg 200 _ 
+.caption [[https://flic.kr/p/4o2YJd][Day 175...One Ring]] (cc) by "bandita"
 
 
 * Finer Grains
@@ -159,6 +180,8 @@ meaning segments aren't added/removed.
 This means we have 99% read locks.
 
 * Deeper locking
+
+Each segment holds its own lock
 
 	type Segments struct {
 		ID           SegmentsID
@@ -189,13 +212,11 @@ List maintenance:
 
 * Implementation
 
-Work...
+.image rwmutex/work.jpg 500 _ 
+.caption [[https://flic.kr/p/9Xpa4W][Blacksmith]] (cc) by-nc-nd "Kansas Tourism"
 
-Work...
 
-Work...
-
-* Add code code
+* Add code, more code
 
 Many places:
 
@@ -208,7 +229,10 @@ Lots of methods like this:
 	// Must hold segments lock (read is fine).
 	func (l *List) saveSegments(ctx context.Context, bs blobstore.Store) error {
 
-* Problem
+.image rwmutex/mic-drop.png 200 _ 
+.caption [[https://github.com/ashleymcnamara/gophers][Gopher Artwork]] (cc) by-nc-sa "Renee French"
+
+* Problems
 
 	// Must hold segments lock (read is fine).
 
@@ -218,6 +242,9 @@ Not possible to call functions that themselves acquire the lock.
 
 We might not want to hold the lock for the entire duration of the call.
 
+.image rwmutex/frustrated.jpg 250 _ 
+.caption [[https://flic.kr/p/75jptu][Frustrated]] (cc) by "Kay Kim"
+
 * Code that hurts
 
 Stuff like:
@@ -226,7 +253,9 @@ Stuff like:
 	defer l.updateLock.Lock()
 	l.segmentsLock.RLock()
 	defer l.segmentsLock.RUnlock()
+
 	...
+
 	// checksplit needs segmentsLock to be unlocked.
 	l.segmentsLock.RUnlock()
 	err = l.checkSplit(ctx, bs)
@@ -236,9 +265,12 @@ Stuff like:
 
 Well, even if my pride hurts, it still works, right?
 
-* Hello Deadlocks my old Friend!
+* Deploy... and...
 
-Approx 50 places accessed this lock. Very easy to make a mistake
+.image rwmutex/deadlocks.jpg 450 _ 
+
+Approx 50 places accessed this lock. 
+
 
 * Problem 1
 
@@ -250,6 +282,8 @@ Approx 50 places accessed this lock. Very easy to make a mistake
 	defer l.updateLock.Lock()
 
 Suddenly we have a potential deadlock.
+
+Easy to make a mistake. Don't make it easy to make mistakes.
 
 * Problem 2
 
@@ -271,10 +305,13 @@ Especially with nested locks this get tricky, since all locks 'below' must be ab
 
 We want our code to be readable and maintainable.
 
-We have a fundamental problem. We should look for a fundamental solution.
+We have a fundamental problem. Needs a fundamental solution.
+
+.image rwmutex/solution.jpg 300 _ 
+.caption [[https://flic.kr/p/TnkwCN][Solution Key]] (cc) by "GotCredit"
 
 
-* Solutions
+* Solution v1
 
 - Add function that locks/unlocks?
 
@@ -286,9 +323,14 @@ Centralizes lock mangement.
 
 But doesn't convey much information.
 
+
+.image rwmutex/laptop.png 200 _ 
+.caption [[https://github.com/ashleymcnamara/gophers][Gopher Artwork]] (cc) by-nc-sa "Renee French"
+
+
 * Solution v2
 
-Minimize usage even more:
+Create a `struct` that contains the data we deal with and information:
 
 	type segments struct {
 		scores, index *Segments
@@ -302,17 +344,22 @@ Minimize usage even more:
 
 	func (l *List) loadSegments(fl loadFlags) (*segments, error)
 
+Now almost functions access the locks anymore.
+
+
 * Sharing locked content
 
-	func (l *List) GetRankTop(offset, elements int) (Elements, error) {
+	// getRankTop only works with locked segments.
+	func (l *List) getRankTop(offset, elements int, segs *segments) (Elements, error)
 
+	// GetRankTop is a public function we can export.
+	func (l *List) GetRankTop(offset, elements int) (Elements, error) {
 		s, _ := l.loadSegments(segsReadOnly|segsAllowUpdates)
 		defer s.unlock()
 		return l.getRankTop(offset, elements, s)
 	}
 
-	func (l *List) getRankTop(offset, elements int, segs *segments) (Elements, error)
-
+	// updateSegments is the only place that can write back segments to the list.
 	func (l *List) updateSegments(s *segments)
 
 * What does this achieve?
@@ -329,7 +376,7 @@ Minimize usage even more:
 
 Managing the elements of single segment:
 
-	type lockedSegment struct {
+	type lockedElements struct {
 		seg      *Segment
 		elements Elements
 		index    int
@@ -337,9 +384,9 @@ Managing the elements of single segment:
 		unlock   func()
 	}
 
-	func (s *Segments) elementsAt(i int, readOnly bool) (ls *lockedSegment, err error)
-	func (s *Segments) newLockedSegment(seg *Segment) *lockedSegment
-	func (s *Segments) replaceSegment(ls *lockedSegment) error
+	func (s *Segments) elementsAt(idx int, readOnly bool) (ls *lockedElements, err error)
+	func (s *Segments) newLockedSegment(seg *Segment) *lockedElements
+	func (s *Segments) replaceSegment(ls *lockedElements) error
 
 * What does it NOT solve?
 
@@ -350,15 +397,60 @@ This still requires careful design.
 But a top level lock could be required to get a lower level lock.
 
 
-	func (s *Segments) elementsAt(ls *segments, i int, readOnly bool) (ls *lockedSegment, err error)
+	func (s *Segments) elementsAt(ls *segments, i int, readOnly bool) (ls *lockedElements, err error)
 
+Just to "prove" you have the lock.
 
 This would force correct usage.
 
+* Testing
+
+Concurrency is easy to mess up, make them easy to test.
+
+
+	// VerifyUnlocked validates that all elements of the list can be locked.
+	// This is only really usable for tests, where list context is controlled.
+	func (l *List) VerifyUnlocked(ctx context.Context, timeout time.Duration) error 
+
+
+	func TestListForceSplit(t *testing.T) {
+		l, err := rankdb.NewList(ctx, "test-list")
+		e, err := l.UpdateElements(ctx, rankdb.NewElements(toUpdate))
+		err = l.VerifyUnlocked(ctx, time.Second*5)
+		err = l.ForceSplit(ctx)
+		err = l.Verify(ctx)
+		err = l.VerifyUnlocked(ctx, time.Second*5)
+		...
+	}
+
+Litter your test code with lock checks.
+
+* Testing
+
+Locking problems can be interactions between any 2 functions.
+
+Add 'complex' tests. Not only simple unit tests.
+
+Exhaustive tests is probably not realistic, but give your tests a good chance of finding deadlocks.
+
+
+.image rwmutex/unlocked.jpg 300 _ 
+.caption [[https://flic.kr/p/LEhgJP][Unlocked]] (cc) by "Sergio Boscaino"
+
+* Conclusion
+
+- You *will* make mistakes in concurrent programming.
+- (Multiple) Read Write locks have tricky deadlock situations.
+- Reduce complexity by wrapping your locks.
+- Have clear responsibilities.
+- Make your concurrent code testable.
+- Give yourself confidence in your code.
+
+.image rwmutex/space-gopher.png 200 _ 
+.caption [[https://github.com/ashleymcnamara/gophers][Gopher Artwork]] (cc) by-nc-sa "Renee French"
+
 * Questions
 
-.image ./zstd/questions.png
-
-
+.image ./rwmutex/questions.png
 
 
